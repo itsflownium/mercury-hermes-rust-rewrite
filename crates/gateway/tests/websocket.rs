@@ -689,6 +689,29 @@ async fn wait_for_observation(client: &mut Client, sid: &str, prompt: &str) -> V
     }).await.unwrap_or_else(|_| panic!("missing verified Observation for {prompt}: {last_reply}"))
 }
 
+#[tokio::test]
+async fn foreground_chat_switches_release_only_that_viewers_old_attachments() {
+    let home = TempDir::new().unwrap();
+    let library = hermes_library::Library::open(home.path()).unwrap();
+    let ids: Vec<_> = (0..65).map(|index| {
+        library.create_session(None, Some(&format!("Saved chat {index}"))).unwrap().id
+    }).collect();
+    let config = Config { base_url: "http://127.0.0.1:1/v1".into(), model: "fixture".into(), api_key: String::new() };
+    let gateway = Gateway::start(GatewayConfig::new(home.path(), config)).await.unwrap();
+    let mut viewer = Client::native(&gateway).await;
+    let mut other = Client::native(&gateway).await;
+    other.ok("session.resume", json!({"session_id":ids[0]})).await;
+    for id in &ids {
+        viewer.ok("session.resume", json!({"session_id":id,"detach_others":true})).await;
+    }
+    let detached = viewer.call("session.close", json!({"session_id":ids[0]})).await;
+    assert_eq!(detached["error"]["data"]["reason"], "not_attached");
+    other.ok("session.close", json!({"session_id":ids[0]})).await;
+    viewer.ok("session.close", json!({"session_id":ids[64]})).await;
+    drop((viewer, other));
+    gateway.shutdown().await.unwrap();
+}
+
 #[cfg(feature = "reliquary")]
 struct PortableGateway {
     process: tokio::process::Child,

@@ -191,6 +191,9 @@ pub struct Run {
     pub gateway_job: Option<Box<Job>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_session: Option<String>,
+    /// The routine conversation selected for publication of this run's result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_routine_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_request_id: Option<String>,
 }

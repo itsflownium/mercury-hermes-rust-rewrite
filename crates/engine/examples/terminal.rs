@@ -16,6 +16,7 @@ async fn main() -> Result<()> {
     while let Ok(event) = inbox.recv().await {
         match event {
             Event::Text(text) => { print!("{text}"); io::stdout().flush()?; }
+            Event::Warning(message) => eprintln!("{message}"),
             Event::Approval { call, answer } => {
                 eprintln!("\nAllow {} {}? [y/N]", call.name, call.arguments);
                 let mut line = String::new();

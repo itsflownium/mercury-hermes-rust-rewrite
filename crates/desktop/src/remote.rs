@@ -1,7 +1,7 @@
 //! A window subscribes to the selected gateway even when another client owns the active turn.
 use super::{Message, connections};
 use hermes_engine::{CancellationToken, Config, Entry, History, Status, ToolCall, Turn};
-use hermes_gateway::client::{ClientMessage, ConnectionState, GatewayClient};
+use hermes_gateway::client::{ClientError, ClientMessage, ConnectionState, GatewayClient};
 use iced::{Task, futures::SinkExt};
 use serde_json::{Value, json};
 use std::{
@@ -132,7 +132,7 @@ impl Connection {
         *self.provider.lock().unwrap() = provider.clone();
         let desired = json!({"model":provider.model,"generation_options":options});
         for _ in 0..3 {
-            let mut snapshot = self.resume(sid).await?;
+            let mut snapshot = self.resume(sid, false).await?;
             self.selection_is_current(selection)?;
             if snapshot["info"]["model"] != desired["model"]
                 || snapshot["info"]["generation_options"] != desired["generation_options"] {
@@ -179,7 +179,7 @@ impl Connection {
                 *self.owner_instance.lock().unwrap() = Some(owner.instance_id().to_owned());
             }
             self.selection_is_current(selection)?;
-            self.resume(sid).await?;
+            self.resume(sid, false).await?;
             return self.client.request("prompt.submit", params).await.map_err(|e| format!("prompt.submit: {e}"));
         }
         let snapshot = self.selected_settings(sid, provider, options, selection).await?;
@@ -190,11 +190,18 @@ impl Connection {
         // server also fences this request against another client's mutation.
         self.client.request("prompt.submit", params).await.map_err(|e| format!("prompt.submit: {e}"))
     }
-    async fn resume(&self, sid: &str) -> Result<Value, String> {
+    async fn resume(&self, sid: &str, detach_others: bool) -> Result<Value, String> {
         if let Some(barrier) = self.client.session_replay_barrier(sid)
             && !barrier.wait().await
         {
             return Err("Gateway disconnected during replay".into());
+        }
+        if detach_others {
+            let reply = self.client.request("session.resume", json!({"session_id":sid,"detach_others":true})).await;
+            // Older gateways may reject the optional parameter.
+            if !matches!(&reply, Err(ClientError::Rpc { code: Some(-32602), .. })) {
+                return reply.map_err(|e| e.to_string());
+            }
         }
         self.client
             .request("session.resume", json!({"session_id":sid}))
@@ -213,7 +220,7 @@ impl Connection {
                 let mut events = self.client.subscribe();
                 let attach = async {
                     self.connect().await?;
-                    self.resume(&sid).await
+                    self.resume(&sid, true).await
                 };
                 let result =
                     tokio::select! { _ = detach.cancelled() => return, result = attach => result };
@@ -250,6 +257,7 @@ impl Connection {
                                                 | "message.complete"
                                                 | "error"
                                                 | "message.error"
+                                                | "message.warning"
                                                 | "subagent.progress"
                                         )
                                     {
@@ -281,7 +289,7 @@ impl Connection {
                                 _ => continue,
                             };
                             if fetch {
-                                let result = tokio::select! { _ = detach.cancelled() => return, result = self.resume(&sid) => result };
+                                let result = tokio::select! { _ = detach.cancelled() => return, result = self.resume(&sid, false) => result };
                                 match result {
                                     Ok(snap) => {
                                         watermark =

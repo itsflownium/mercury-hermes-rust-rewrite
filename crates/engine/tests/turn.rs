@@ -82,6 +82,41 @@ async fn external_memory_connector_follows_live_profile_selection() {
     server.abort();
 }
 
+#[tokio::test]
+async fn a_chat_turn_continues_when_its_mcp_server_is_unavailable() {
+    async fn model(State(requests): State<Requests>, Json(body): Json<Value>)
+        -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+        requests.lock().unwrap().push(body);
+        let reply = json!({"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":"stop"}]});
+        Sse::new(stream::iter([Ok(SseEvent::default().data(reply.to_string()))]))
+    }
+
+    let requests = Requests::default();
+    let server = Router::new()
+        .route("/v1/chat/completions", post(model))
+        .route("/mcp", post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }))
+        .with_state(requests.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, server).await.unwrap(); });
+    let profile = tempdir().unwrap();
+    let dir = tempdir().unwrap();
+    hermes_engine::connector::save(profile.path(), &format!("{origin}/mcp"), "", false).unwrap();
+    let mut session = Session::open_for_profile(dir.path(), None, profile.path()).unwrap();
+    let config = Config { base_url: format!("{origin}/v1"), model: "fixture".into(), api_key: String::new() };
+    let (events, received) = async_channel::unbounded();
+    session.turn(config, "Hello".into(), events, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(session.history().turns.last().unwrap().status, Status::Complete);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    let warnings: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).filter_map(|event| match event {
+        Event::Warning(message) => Some(message),
+        _ => None,
+    }).collect();
+    assert_eq!(warnings, ["The profile MCP server is unavailable for this turn."]);
+    server.abort();
+}
+
 async fn fake_model(State(requests): State<Requests>, Json(body): Json<Value>)
     -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
     let mut requests = requests.lock().unwrap();

@@ -146,8 +146,18 @@ pub(super) async fn routine_for(shared: &Arc<Shared>, job_id: &str, title: &str)
     let summary = match index.get(job_id).and_then(|id| shared.library.session(id).ok()).filter(|s| !s.archived) {
         Some(summary) => summary,
         None => {
-            // A background chat never takes over the user's open "New chat" or the selection.
-            let summary = shared.library.create_background_session(&format!("Routine · {title}"), &format!("routine-chat:{job_id}"), |_| Ok(()))?;
+            // Derive each successor from its predecessor so a retry finds the same replacement.
+            let mut predecessor = index.get(job_id).cloned();
+            let title = format!("Routine · {title}");
+            let summary = loop {
+                let key = match &predecessor {
+                    Some(id) => format!("routine-chat:{job_id}:after:{id}"),
+                    None => format!("routine-chat:{job_id}"),
+                };
+                let summary = shared.library.create_background_session(&title, &key, |_| Ok(()))?;
+                if !summary.archived { break summary; }
+                predecessor = Some(summary.id);
+            };
             index.insert(job_id.to_owned(), summary.id.clone());
             let mut temp = NamedTempFile::new_in(shared.library.root())?;
             serde_json::to_writer_pretty(&mut temp, &index)?;
@@ -157,6 +167,38 @@ pub(super) async fn routine_for(shared: &Arc<Shared>, job_id: &str, title: &str)
         }
     };
     shared.session(&summary.id).await.map_err(|error| anyhow::anyhow!(error.message))
+}
+
+async fn publish_routine_turn(shared: &Arc<Shared>, store: &Store, claim: &Claim, turn: &hermes_engine::Turn) -> Result<bool> {
+    let source = format!("cron:{}", claim.run.id);
+    loop {
+        if shared.shutdown.is_cancelled() { return Ok(false); }
+        {
+            // Select and publish together with respect to catalog archive and delete operations.
+            let _catalog = shared.catalog_edits.lock().await;
+            let routine = if let Some(id) = &claim.run.gateway_routine_session {
+                match shared.session(id).await {
+                    Ok(session) => session,
+                    Err(error) if error.data["reason"] == "not_found" => return Ok(true),
+                    Err(error) => anyhow::bail!(error.message),
+                }
+            } else {
+                routine_for(shared, &claim.job.id, claim.job.title()).await?
+            };
+            let id = lock(&routine.summary).id.clone();
+            if shared.try_publish_background_turn(&routine, &source, turn, || {
+                // Save the chosen destination before writing the receipt so recovery follows it.
+                if claim.run.gateway_routine_session.is_none() {
+                    store.bind_gateway_routine(&claim.run.id, &id)?;
+                }
+                Ok(())
+            })? {
+                shared.emit(&routine, "session.info", shared.info(&routine));
+                return Ok(true);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
@@ -244,16 +286,10 @@ async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
         finished.context("Scheduled admission did not finish")?
     };
     let turn = finished.turn;
-    if let Some(turn) = &turn {
-        let routine = routine_for(&shared, &claim.job.id, claim.job.title()).await?;
-        loop {
-            if shared.shutdown.is_cancelled() { return Ok(()); }
-            if shared.publish_background_turn(&routine, &format!("cron:{}", claim.run.id), turn.clone()).await? {
-                shared.emit(&routine, "session.info", shared.info(&routine));
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+    if let Some(turn) = &turn
+        && !publish_routine_turn(&shared, &store, &claim, turn).await?
+    {
+        return Ok(());
     }
     let outcome = match turn {
         Some(turn) => match turn.status {
@@ -342,6 +378,57 @@ mod tests {
         assert_eq!(library.session(&run_chat).unwrap().project_id, None, "not filed under the default project");
         assert_eq!(gateway.shared.library.workspace_for_session(&run_chat).unwrap(), None);
         assert_eq!(session.settings.lock().unwrap().cwd.as_deref(), Some(job_folder.canonicalize().unwrap().as_path()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_routine_run_after_archiving_uses_a_new_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gateway, server) = isolated_gateway(dir.path()).await;
+        let store = &gateway.shared.scheduler;
+        let job = store.create(cron::Draft {
+            prompt: "scheduled".into(), paused: true, ..Default::default()
+        }, chrono::Utc::now()).unwrap();
+        let first = store.claim_gateway_now(&job.id, "before-archive", chrono::Utc::now()).unwrap();
+        run(gateway.shared.clone(), store.clone(), first).await.unwrap();
+        let old = routine_for(&gateway.shared, &job.id, job.title()).await.unwrap();
+        let old_id = lock(&old.summary).id.clone();
+        assert_eq!(read_record(&old.dir).unwrap().history.turns.len(), 1);
+        gateway.shared.library.set_archived(&old_id, true).unwrap();
+
+        let second = store.claim_gateway_now(&job.id, "after-archive", chrono::Utc::now()).unwrap();
+        run(gateway.shared.clone(), store.clone(), second).await.unwrap();
+        let current = routine_for(&gateway.shared, &job.id, job.title()).await.unwrap();
+        let current_id = lock(&current.summary).id.clone();
+        assert_ne!(current_id, old_id);
+        assert_eq!(read_record(&current.dir).unwrap().history.turns.len(), 1);
+        assert!(gateway.shared.library.session(&old_id).unwrap().archived);
+        assert_eq!(read_record(&old.dir).unwrap().history.turns.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn recovering_a_published_run_keeps_its_routine_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gateway, server) = isolated_gateway(dir.path()).await;
+        let store = &gateway.shared.scheduler;
+        let (claim, _) = bound_claim(&gateway).await;
+        let turn = hermes_engine::Turn {
+            prompt: "scheduled".into(), context: String::new(), attachments: vec![], model: "fixture".into(),
+            entries: vec![hermes_engine::Entry::Assistant { text: "done".into(), calls: vec![] }],
+            status: hermes_engine::Status::Complete,
+        };
+        assert!(publish_routine_turn(&gateway.shared, store, &claim, &turn).await.unwrap());
+        let saved = store.gateway_claims().unwrap().into_iter()
+            .find(|saved| saved.run.id == claim.run.id).unwrap();
+        let archived_id = saved.run.gateway_routine_session.as_deref().unwrap();
+        let archived = gateway.shared.library.set_archived(archived_id, true).unwrap();
+        let replacement = routine_for(&gateway.shared, &claim.job.id, claim.job.title()).await.unwrap();
+        assert_ne!(lock(&replacement.summary).id, archived_id);
+
+        assert!(publish_routine_turn(&gateway.shared, store, &saved, &turn).await.unwrap());
+        assert_eq!(read_record(&archived.directory).unwrap().history.turns.len(), 1);
+        assert!(read_record(&replacement.dir).unwrap().history.turns.is_empty());
         server.abort();
     }
 

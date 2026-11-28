@@ -447,17 +447,26 @@ impl Shared {
     }
 
     /// Atomically publish a completed producer turn and its source identity.
-    /// Returns false while other session work must be ordered first.
-    pub(crate) async fn publish_background_turn(&self, session: &LiveSession, source: &str, turn: hermes_engine::Turn) -> Result<bool> {
-        let mut engine = session.engine.lock().await;
+    /// Returns false when the conversation is busy. The callback runs once the
+    /// turn can be written, so the producer can persist its destination first.
+    pub(crate) fn try_publish_background_turn(
+        &self,
+        session: &LiveSession,
+        source: &str,
+        turn: &hermes_engine::Turn,
+        before_publish: impl FnOnce() -> Result<()>,
+    ) -> Result<bool> {
+        let Ok(mut engine) = session.engine.try_lock() else { return Ok(false); };
         let mut view = lock(&session.view);
         let source = format!("producer-result:{source}");
-        let payload = serde_json::to_value(&turn)?;
+        let payload = serde_json::to_value(turn)?;
         if let Some(existing) = view.authority.receipts.iter().find(|r| r.input_id.as_deref() == Some(&source)) {
             ensure!(existing.result.as_ref() == Some(&payload), "Producer identity reused for another result");
+            before_publish()?;
             return Ok(true);
         }
         if view.running || view.authority.receipts.iter().any(|r| r.status != "terminal") { return Ok(false); }
+        before_publish()?;
         let mut history = view.history.clone();
         let turn_index = history.turns.len();
         history.turns.push(turn.clone());
@@ -1048,17 +1057,17 @@ mod publication_tests {
         let chat = gateway.shared.library.create_session(None, None).unwrap();
         let session = gateway.shared.session(&chat.id).await.unwrap();
         let turn = hermes_engine::Turn { context: String::new(), attachments: vec![], prompt: "scheduled".into(), model: "fixture".into(), entries: vec![hermes_engine::Entry::Assistant { text: "done".into(), calls: vec![] }], status: hermes_engine::Status::Complete };
-        assert!(gateway.shared.publish_background_turn(&session, "run-1", turn.clone()).await.unwrap());
-        assert!(gateway.shared.publish_background_turn(&session, "run-1", turn.clone()).await.unwrap());
+        assert!(gateway.shared.try_publish_background_turn(&session, "run-1", &turn, || Ok(())).unwrap());
+        assert!(gateway.shared.try_publish_background_turn(&session, "run-1", &turn, || Ok(())).unwrap());
         assert_eq!(lock(&session.view).history.turns.len(), 1);
         drop(session);
         gateway.shutdown().await.unwrap();
         let gateway = Gateway::start(GatewayConfig::new(dir.path(), config())).await.unwrap();
         let session = gateway.shared.session(&chat.id).await.unwrap();
-        assert!(gateway.shared.publish_background_turn(&session, "run-1", turn.clone()).await.unwrap());
+        assert!(gateway.shared.try_publish_background_turn(&session, "run-1", &turn, || Ok(())).unwrap());
         assert_eq!(lock(&session.view).history.turns.len(), 1);
         let mut changed = turn; changed.prompt = "different".into();
-        assert!(gateway.shared.publish_background_turn(&session, "run-1", changed).await.is_err());
+        assert!(gateway.shared.try_publish_background_turn(&session, "run-1", &changed, || Ok(())).is_err());
         drop(session);
         gateway.shutdown().await.unwrap();
     }

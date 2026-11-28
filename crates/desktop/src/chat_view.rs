@@ -714,6 +714,11 @@ impl Hermes {
                     "message.error" | "error" => {
                         self.error(p["message"].as_str().unwrap_or("Gateway request failed"))
                     }
+                    "message.warning" => {
+                        if let Some(message) = p["message"].as_str() {
+                            self.note(message);
+                        }
+                    }
                     "message.delta" => {
                         let delta = p["text"].as_str().unwrap_or_default();
                         if let Some(turn) = self

@@ -198,12 +198,29 @@ impl Store {
         }).collect())
     }
     pub fn bind_gateway_session(&self, run_id: &str, session_id: &str) -> Result<()> {
+        self.bind_gateway_chat(run_id, session_id, |run| &mut run.gateway_session)
+    }
+
+    pub fn bind_gateway_routine(&self, run_id: &str, session_id: &str) -> Result<()> {
+        self.bind_gateway_chat(run_id, session_id, |run| &mut run.gateway_routine_session)
+    }
+
+    fn bind_gateway_chat(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        binding: impl FnOnce(&mut Run) -> &mut Option<String>,
+    ) -> Result<()> {
         ensure!(self.gateway && self.owns_scheduler(), "Gateway scheduler does not own this profile");
         self.transaction(|document| {
             let run = document.runs.iter_mut().find(|run| run.id == run_id).context("Run no longer exists")?;
             ensure!(run.status.live() && run.owner == self.owner.id && run.gateway_job.is_some(), "Run claim is stale");
-            if let Some(existing) = &run.gateway_session { ensure!(existing == session_id, "Run is already bound to another session"); }
-            else { run.gateway_session = Some(session_id.to_owned()); }
+            let target = binding(run);
+            if let Some(existing) = target {
+                ensure!(existing == session_id, "Run is already bound to another session");
+            } else {
+                *target = Some(session_id.to_owned());
+            }
             Ok(())
         })
     }
@@ -731,6 +748,7 @@ fn claim(
         cancel_requested: false,
         gateway_job: gateway.then(|| Box::new(job.clone())),
         gateway_session: None,
+        gateway_routine_session: None,
         gateway_request_id: request_id.map(str::to_owned),
     };
     let claim = Claim {

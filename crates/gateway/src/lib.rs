@@ -1028,7 +1028,15 @@ impl Shared {
                     .await
             }
             "session.resume" | "session.activate" => {
-                let session = self.resolve(params).await?;
+                let id = required_string(params, "session_id")?;
+                if params["detach_others"] == true {
+                    for (previous, session) in self.sessions.lock().await.iter() {
+                        if previous != id {
+                            lock(&session.peers).remove(&peer.id);
+                        }
+                    }
+                }
+                let session = self.session(id).await?;
                 lock(&session.peers).insert(peer.id.clone(), peer.clone());
                 Ok(self.snapshot(
                     &session,
@@ -2185,6 +2193,7 @@ impl Shared {
         match event {
             Event::Subagent(progress) => self.emit(session, "subagent.progress", serde_json::to_value(&progress).unwrap_or_default()),
             Event::MemoryRecall(status) => self.emit(session, "memory.recall", serde_json::to_value(status).unwrap_or_default()),
+            Event::Warning(message) => self.emit(session, "message.warning", json!({"message":message})),
             Event::Clarification { question, choices, answer } => {
                 let request = new_id();
                 let mut view = lock(&session.view);

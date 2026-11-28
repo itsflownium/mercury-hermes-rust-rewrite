@@ -58,6 +58,7 @@ pub use tokio_util::sync::CancellationToken;
 pub enum Event {
     Snapshot(History),
     Text(String),
+    Warning(String),
     Approval { call: ToolCall, answer: Sender<bool> },
     Clarification { question: String, choices: Vec<String>, answer: Sender<String> },
     Correction { text: String },
@@ -369,7 +370,16 @@ impl Session {
         let ego_query = ego.as_ref().map(|_| turn.prompt.clone()).unwrap_or_default();
         let mut memory_results = Vec::new();
         let mut python_results = Vec::new();
-        let mut mcp: Vec<mcp::Mcp> = if allow_tools && self.settings.connect_profile_mcp() {connector::connect(&self.profile_root).await.context("Could not connect configured MCP server")?.into_iter().collect()}else{vec![]};
+        let mut mcp = Vec::new();
+        if allow_tools && self.settings.connect_profile_mcp() {
+            match connector::connect(&self.profile_root).await {
+                Ok(server) => mcp.extend(server),
+                Err(error) => {
+                    eprintln!("profile MCP server unavailable: {error:#}");
+                    let _ = events.try_send(Event::Warning("The profile MCP server is unavailable for this turn.".into()));
+                }
+            }
+        }
         // Enabled catalog plugins (Agent Plugins v1) add their MCP servers; one that fails is skipped.
         if let Some(runtime) = &runtime && self.settings.mcp_tools {
             let (live, errors) = runtime.tool_connections().await;
