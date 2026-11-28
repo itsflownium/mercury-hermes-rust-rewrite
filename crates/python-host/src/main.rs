@@ -156,7 +156,36 @@ fn python_command(args: &[String]) -> Option<(&str, &[String])> {
     (args.get(index)? == "-c").then(|| Some((args.get(index + 1)?.as_str(), &args[index + 2..])))?
 }
 
+#[cfg(windows)]
+fn redirect_worker_stdin() -> Result<(), &'static str> {
+    // SAFETY: the worker is still single-threaded. Replace CPython's CRT stdin descriptor
+    // and close only the temporary descriptor we opened.
+    unsafe {
+        let null = libc::open(c"NUL".as_ptr(), libc::O_RDONLY | libc::O_BINARY);
+        if null < 0 {
+            return Err("could not open NUL");
+        }
+        if null != 0 {
+            let result = libc::dup2(null, 0);
+            libc::close(null);
+            if result != 0 {
+                return Err("could not replace file descriptor 0");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_code(source: &str, rest: &[String]) -> i32 {
+    // A pending read on the inherited MCP pipe can block CPython's stdin initialization
+    // on Windows (python/cpython#78961). Multiprocessing bootstraps over a separate handle.
+    #[cfg(windows)]
+    if rest.first().is_some_and(|arg| arg == "--multiprocessing-fork")
+        && let Err(error) = redirect_worker_stdin()
+    {
+        eprintln!("Could not redirect Python worker stdin: {error}");
+        return 1;
+    }
     start();
     let code = c"
 import sys, traceback

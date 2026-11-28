@@ -347,20 +347,22 @@ def register(ctx):
     }
 }
 
-// Windows is not covered yet: its spawned worker does not answer in CI, and the cause is unknown.
-#[cfg(unix)]
 #[test]
 fn a_plugin_can_start_a_spawned_worker_process() {
     let (_dir, mut host) = launch_plugin(r#"
-import multiprocessing, os, sys
+import multiprocessing, sys
 def exit_three():
     sys.exit(3)
 def start_worker(args, **_):
     # The target is the plugin's own function, which the worker must import.
     worker = multiprocessing.get_context("spawn").Process(target=exit_three)
     worker.start()
-    worker.join(60)
-    return {"exitcode": worker.exitcode}
+    worker.join(5)
+    exitcode = worker.exitcode
+    if exitcode is None:
+        worker.terminate()
+        worker.join(2)
+    return {"exitcode": exitcode}
 def register(ctx):
     ctx.register_tool("start_worker", "workers", {"name": "start_worker", "description": "", "parameters": {"type": "object"}}, start_worker)
 "#, false);
